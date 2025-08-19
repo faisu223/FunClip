@@ -84,7 +84,24 @@ class VideoClipper():
 
         if timestamp_list is None:
             all_ts = []
-            if dest_spk is None or dest_spk == '' or 'sd_sentences' not in state:
+            log_append = ""
+            if state.get('srt_uploaded'):
+                sentences = state['sentences']
+                for _dest_text in dest_text.split('#'):
+                    if '[' in _dest_text:
+                        match = re.search(r'\[(\d+),\s*(\d+)\]', _dest_text)
+                        if match:
+                            offset_b, offset_e = map(int, match.groups())
+                        else:
+                            offset_b, offset_e = 0, 0
+                        _dest_text = _dest_text[:_dest_text.find('[')]
+                    else:
+                        offset_b, offset_e = 0, 0
+                    _dest_text = pre_proc(_dest_text)
+                    for sentence in sentences:
+                        if _dest_text.lower() in sentence['text'].lower():
+                            all_ts.append([(sentence['start'] + offset_b) * 16, (sentence['end'] + offset_e) * 16])
+            elif dest_spk is None or dest_spk == '' or 'sd_sentences' not in state:
                 for _dest_text in dest_text.split('#'):
                     if '[' in _dest_text:
                         match = re.search(r'\[(\d+),\s*(\d+)\]', _dest_text)
@@ -191,7 +208,24 @@ class VideoClipper():
         
         if timestamp_list is None:
             all_ts = []
-            if dest_spk is None or dest_spk == '' or 'sd_sentences' not in state:
+            log_append = ""
+            if state.get('srt_uploaded'):
+                sentences = state['sentences']
+                for _dest_text in dest_text.split('#'):
+                    if '[' in _dest_text:
+                        match = re.search(r'\[(\d+),\s*(\d+)\]', _dest_text)
+                        if match:
+                            offset_b, offset_e = map(int, match.groups())
+                        else:
+                            offset_b, offset_e = 0, 0
+                        _dest_text = _dest_text[:_dest_text.find('[')]
+                    else:
+                        offset_b, offset_e = 0, 0
+                    _dest_text = pre_proc(_dest_text)
+                    for sentence in sentences:
+                        if _dest_text.lower() in sentence['text'].lower():
+                            all_ts.append([(sentence['start'] + offset_b) * 16, (sentence['end'] + offset_e) * 16])
+            elif dest_spk is None or dest_spk == '' or 'sd_sentences' not in state:
                 for _dest_text in dest_text.split('#'):
                     if '[' in _dest_text:
                         match = re.search(r'\[(\d+),\s*(\d+)\]', _dest_text)

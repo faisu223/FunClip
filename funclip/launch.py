@@ -5,16 +5,40 @@
 
 from http import server
 import os
+import re
 import logging
 import argparse
+import moviepy.editor as mpy
 import gradio as gr
 from funasr import AutoModel
 from videoclipper import VideoClipper
 from llm.openai_api import openai_call
 from llm.qwen_api import call_qwen_model
 from llm.g4f_openai_api import g4f_openai_call
+from llm.gemini_api import call_gemini_model
 from utils.trans_utils import extract_timestamps
 from introduction import top_md_1, top_md_3, top_md_4
+
+
+def srt_time_to_ms(time_str):
+    parts = time_str.replace(',', ':').split(':')
+    h, m, s, ms = [int(p) for p in parts]
+    return (h * 3600 + m * 60 + s) * 1000 + ms
+
+def parse_srt(srt_string):
+    sentences = []
+    # A robust regex to handle various line endings and the last subtitle block
+    srt_pattern = re.compile(r'\d+\s*\n(\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\n\d+|\Z)', re.DOTALL)
+    for match in srt_pattern.finditer(srt_string.strip()):
+        start_time_str = match.group(1)
+        end_time_str = match.group(2)
+        text = match.group(3).strip().replace('\n', ' ')
+        start_ms = srt_time_to_ms(start_time_str)
+        end_ms = srt_time_to_ms(end_time_str)
+        # Mimic the structure of funasr's output for compatibility
+        sentences.append({'start': start_ms, 'end': end_ms, 'text': text, 'ts_list': [[start_ms, end_ms]]})
+    full_text = "\n".join([s['text'] for s in sentences])
+    return sentences, full_text
 
 
 if __name__ == "__main__":
@@ -116,15 +140,24 @@ if __name__ == "__main__":
             add_sub=True, dest_spk=video_spk_input, output_dir=output_dir
             )
         
-    def llm_inference(system_content, user_content, srt_text, model, apikey):
-        SUPPORT_LLM_PREFIX = ['qwen', 'gpt', 'g4f', 'moonshot', 'deepseek']
+    def llm_inference(system_content, user_content, srt_text, model, apikey, num_clips, clip_length):
+        SUPPORT_LLM_PREFIX = ['qwen', 'gpt', 'g4f', 'moonshot', 'deepseek', 'gemini']
+
+        constraints = (
+            f"Please ensure the output contains around **{int(num_clips)}** clips, "
+            f"and each clip is approximately **{int(clip_length)}** seconds long."
+        )
+        final_system_prompt = f"{constraints}\n\n{system_content}"
+
         if model.startswith('qwen'):
-            return call_qwen_model(apikey, model, user_content+'\n'+srt_text, system_content)
+            return call_qwen_model(apikey, model, user_content+'\n'+srt_text, final_system_prompt)
         if model.startswith('gpt') or model.startswith('moonshot') or model.startswith('deepseek'):
-            return openai_call(apikey, model, system_content, user_content+'\n'+srt_text)
+            return openai_call(apikey, model, final_system_prompt, user_content+'\n'+srt_text)
         elif model.startswith('g4f'):
             model = "-".join(model.split('-')[1:])
-            return g4f_openai_call(model, system_content, user_content+'\n'+srt_text)
+            return g4f_openai_call(model, final_system_prompt, user_content+'\n'+srt_text)
+        elif model.startswith('gemini'):
+            return call_gemini_model(apikey, model, user_content+'\n'+srt_text, final_system_prompt)
         else:
             logging.error("LLM name error, only {} are supported as LLM name prefix."
                           .format(SUPPORT_LLM_PREFIX))
@@ -165,6 +198,46 @@ if __name__ == "__main__":
                 dest_spk=video_spk_input, output_dir=output_dir, timestamp_list=timestamp_list, add_sub=True)
             return None, (sr, res_audio), message, clip_srt
     
+    def handle_srt_upload(srt_file, video_path, audio_input, hotwords, output_dir):
+        if srt_file is None:
+            return "", "", None, None, gr.update(interactive=True), gr.update(interactive=True)
+        with open(srt_file.name, 'r', encoding='utf-8') as f:
+            srt_content = f.read()
+        sentences, full_text = parse_srt(srt_content)
+        video_state, audio_state = None, None
+        output_dir = output_dir.strip()
+        if not len(output_dir):
+            output_dir = None
+        else:
+            output_dir = os.path.abspath(output_dir)
+        if video_path is not None:
+            video = mpy.VideoFileClip(video_path)
+            video_state = {
+                'video_filename': video_path,
+                'clip_video_file': os.path.splitext(os.path.basename(video_path))[0] + '_clip.mp4',
+                'video': video,
+                'sentences': sentences,
+                'srt_uploaded': True,
+                'recog_res_raw': full_text,
+                'timestamp': [],
+            }
+            if output_dir is not None:
+                os.makedirs(output_dir, exist_ok=True)
+                with open(os.path.join(output_dir, 'total.srt'), 'w', encoding='utf-8') as f:
+                    f.write(srt_content)
+                with open(os.path.join(output_dir, 'recog_res_raw.txt'), 'w', encoding='utf-8') as f:
+                    f.write(full_text)
+        elif audio_input is not None:
+            sr, data = audio_input
+            audio_state = {
+                'audio_input': (sr, data),
+                'sentences': sentences,
+                'srt_uploaded': True,
+                'recog_res_raw': full_text,
+                'timestamp': [],
+            }
+        return full_text, srt_content, video_state, audio_state, gr.update(interactive=False), gr.update(interactive=False)
+
     # gradio interface
     theme = gr.Theme.load("funclip/utils/theme.json")
     with gr.Blocks(theme=theme) as funclip_service:
@@ -179,6 +252,8 @@ if __name__ == "__main__":
                     video_input = gr.Video(label="视频输入 | Video Input")
                     audio_input = gr.Audio(label="音频输入 | Audio Input")
                 with gr.Column():
+                    srt_input = gr.File(label="或上传SRT文件 | Or Upload SRT File", file_types=['.srt'])
+                    gr.Markdown("上传SRT文件后，将禁用识别功能，直接使用SRT文件进行后续操作。")
                     gr.Examples(['https://isv-data.oss-cn-hangzhou.aliyuncs.com/ics/MaaS/ClipVideo/%E4%B8%BA%E4%BB%80%E4%B9%88%E8%A6%81%E5%A4%9A%E8%AF%BB%E4%B9%A6%EF%BC%9F%E8%BF%99%E6%98%AF%E6%88%91%E5%90%AC%E8%BF%87%E6%9C%80%E5%A5%BD%E7%9A%84%E7%AD%94%E6%A1%88-%E7%89%87%E6%AE%B5.mp4', 
                                  'https://isv-data.oss-cn-hangzhou.aliyuncs.com/ics/MaaS/ClipVideo/2022%E4%BA%91%E6%A0%96%E5%A4%A7%E4%BC%9A_%E7%89%87%E6%AE%B52.mp4', 
                                  'https://isv-data.oss-cn-hangzhou.aliyuncs.com/ics/MaaS/ClipVideo/%E4%BD%BF%E7%94%A8chatgpt_%E7%89%87%E6%AE%B5.mp4'],
@@ -209,15 +284,21 @@ if __name__ == "__main__":
                         prompt_head2 = gr.Textbox(label="Prompt User（不需要修改，会自动拼接左下角的srt字幕）", value=("这是待裁剪的视频srt字幕："))
                         with gr.Column():
                             with gr.Row():
+                                num_clips_input = gr.Number(label="期望片段数量 | Number of Clips", value=3, step=1, minimum=1)
+                                clip_length_input = gr.Number(label="期望片段长度(秒) | Target Length (seconds)", value=15, minimum=1)
+                            with gr.Row():
                                 llm_model = gr.Dropdown(
                                     choices=[
-                                        "deepseek-chat"
+                                        "gemini-1.5-flash",
+                                        "gemini-1.5-pro",
+                                        "gemini-pro",
+                                        "deepseek-chat",
                                         "qwen-plus",
-                                             "gpt-3.5-turbo", 
-                                             "gpt-3.5-turbo-0125", 
-                                             "gpt-4-turbo",
-                                             "g4f-gpt-3.5-turbo"], 
-                                    value="deepseek-chat",
+                                        "gpt-3.5-turbo",
+                                        "gpt-3.5-turbo-0125",
+                                        "gpt-4-turbo",
+                                        "g4f-gpt-3.5-turbo"],
+                                    value="gemini-1.5-flash",
                                     label="LLM Model Name",
                                     allow_custom_value=True)
                                 apikey_input = gr.Textbox(label="APIKEY")
@@ -243,7 +324,13 @@ if __name__ == "__main__":
                 audio_output = gr.Audio(label="裁剪结果 | Audio Clipped")
                 clip_message = gr.Textbox(label="⚠️ 裁剪信息 | Clipping Log")
                 srt_clipped = gr.Textbox(label="📖 裁剪部分SRT字幕内容 | Clipped RST Subtitles")            
-                
+
+        srt_input.upload(
+            handle_srt_upload,
+            inputs=[srt_input, video_input, audio_input, hotwords_input, output_dir],
+            outputs=[video_text_output, video_srt_output, video_state, audio_state, recog_button, recog_button2]
+        )
+
         recog_button.click(mix_recog, 
                             inputs=[video_input, 
                                     audio_input, 
@@ -280,7 +367,7 @@ if __name__ == "__main__":
                                    ], 
                            outputs=[video_output, clip_message, srt_clipped])
         llm_button.click(llm_inference,
-                         inputs=[prompt_head, prompt_head2, video_srt_output, llm_model, apikey_input],
+                         inputs=[prompt_head, prompt_head2, video_srt_output, llm_model, apikey_input, num_clips_input, clip_length_input],
                          outputs=[llm_result])
         llm_clip_button.click(AI_clip, 
                            inputs=[llm_result,
